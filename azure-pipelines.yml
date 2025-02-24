@@ -1,19 +1,148 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+def readYamlFile() {
+    echo 'Leyendo configuración YAML'
+    def data = readYaml(file: "${DEPLOYMENT_PATH}/${DEPLOYMENT_NAME}.yaml")
+    return data
+}
 
-trigger:
-- main
+pipeline {
+    agent any
 
-pool:
-  vmImage: ubuntu-latest
+    environment {
+        PROJECT_ID = 'sura-pe-dev-analitica'
+        SCHEMA_PATH = 'schemas'
+        SCHEDULED_PATH = 'scheduled'
+        DEPLOYMENT_PATH = 'deployments'
+        DEPLOYMENT_NAME = 'v1.0.0'
+        ENVIRONMENT = 'dev'
+        GCP_SERVICE_ACCOUNT = 'sura-integra-gcp-devops-jenkins-desa-v2'
+        GCP_LOCATION = 'us-central1'
+    }
+    
+ stages {
+        stage('Descarga de Fuentes') {
+            steps {
+                script {
+                    deleteDir()
+                    checkout scm
+                }
+            }
+        }
 
-steps:
-- script: echo ¡Hola, mundo!
-  displayName: 'Saludo inicial'
 
-- script: |
-    echo Este es un pipeline básico.
-    echo Puedes agregar más pasos aquí.
-  displayName: 'Mensaje adicional'
+        stage('Activando Service Account') {
+            steps {
+                withCredentials([file(credentialsId: "${GCP_SERVICE_ACCOUNT}", variable: 'SECRET_FILE')]) {
+                    sh """\$(gcloud auth activate-service-account --key-file=\$SECRET_FILE)"""
+                }
+            }
+        }
+
+        stage('Configurando scripts [SCHEMA]') {
+            steps {
+                script {
+
+                        def data = readYamlFile()
+                        schemas = data.schemas
+
+                        schemas.each { schema, value ->
+                        schemas[schema].each { script ->
+                            sh """sed -i -e 's|\${env}|${ENVIRONMENT}|g' -e 's|\${schema_name}|${schema}|g' '${SCHEMA_PATH}/${schema}/${script}'"""
+                            sh """cat  '${SCHEMA_PATH}/${schema}/${script}' >> script.sql"""
+                            sh """echo '\n' >> script.sql"""
+                           }
+                        }
+                   
+                }
+            }
+        }
+
+        stage('Configurando scripts [SCHEDULED]') {
+            steps {
+                script {
+                   
+                        sh """find ${SCHEDULED_PATH} -type f -exec sed -i 's|\${env}|${ENVIRONMENT}|g' {} +"""
+               
+                }
+            }
+        }
+        
+        stage('Mostrar contenido de script.sql') {
+            steps {
+                script {
+                    
+                    sh "cat script.sql"
+                    
+                }
+            }
+        }
+        
+        stage('Ejecución de Scripts') {
+            steps {
+                script {
+                        // Ejecutar el dry run
+                        sh "bq --location ${GCP_LOCATION} query --dry_run --project_id=${PROJECT_ID} --use_legacy_sql=false --flagfile=script.sql"
+
+                        def data = readYamlFile()
+                        def schemas = data.schemas
+
+                        // Eliminar los esquemas, tablas y views si existen
+                        /*schemas.each { schema, value ->
+                            sh "bq --location ${GCP_LOCATION} rm -r -f -d ${PROJECT_ID}:${schema}" // Eliminar esquema
+                        }*/
+
+                        // Crear los esquemas, tablas y views
+                        schemas.each { schema, value ->
+                            value.each { script ->
+                                sh "bq --location ${GCP_LOCATION} query --project_id=${PROJECT_ID} --use_legacy_sql=false --flagfile='${SCHEMA_PATH}/${schema}/${script}'"
+                            }
+                        }
+                }
+            }
+        }
+
+        stage('Creating Scheduled Queries') {
+            steps {
+                script {
+                        def data = readYamlFile()
+                        scheduled = data.scheduled
+
+                        scheduled.each { value ->
+                            println 'ini'
+                            def display_name = value['display_name']
+                            def action = value['action'] ?: 'create'
+                            def schedule = value['schedule']
+                            def filepath = value['file']
+                            def location = value['location'] ?: 'us'
+
+                            def result = sh(script: "bq --location ${GCP_LOCATION} ls --format=json --project_id=${PROJECT_ID} --transfer_config --transfer_location=us | jq -r '.[] | select(.displayName==\"${display_name}\")'", returnStdout: true)
+                            def query = sh(script: "tr -s '[:space:]' ' ' < scheduled/${filepath} | sed 's/\"/\\\"/g' | sed 's|`|\\\\`|g'", returnStdout: true)
+                            def internal_name = sh(script: "echo '${result}' | jq -r '.name'", returnStdout: true)
+                            println internal_name
+                            println result
+                            println query
+
+                            if (result == null || result.isEmpty()) {
+                                sh """
+                                    PARAMS='{\"query\":\"${query}\"}'
+                                    echo \$PARAMS
+                                    bq --location ${GCP_LOCATION} mk --project_id='${PROJECT_ID}' --transfer_config --display_name='${display_name}' --location='${location}' --data_source=scheduled_query --schedule='${schedule}' --params=\"{\\\"query\\\":\\\"${query}\\\"}\"
+                                """
+                            } else {
+                                sh """
+                                    PARAMS='{\"query\":\"${query}\"}'
+                                    echo \$PARAMS
+                                    bq --location ${GCP_LOCATION} update --project_id=${PROJECT_ID} --transfer_config --params=\"{\\\"query\\\":\\\"${query}\\\"}\" ${internal_name}
+                                """
+                            }
+                        }
+                }
+            }
+        }
+
+        stage('Limpiar Workspace') {
+            steps {
+                deleteDir()
+            }
+        }
+    }
+}
